@@ -1,95 +1,26 @@
-/* Robust Zing adapter: thử nhiều lib & nhiều tên hàm */
+// server.js
 const express = require("express");
 const cors = require("cors");
-const fetch = require("node-fetch");
 
-function safeRequire(name) {
-  try { return require(name); } catch { return null; }
+// nạp gói và “bắt mọi kiểu export”
+const zlib = require("zingmp3-api-next");     // v1.0.4
+const zingRaw = zlib?.zing || zlib?.default || zlib;
+
+// chọn đúng hàm (tên có thể khác nhau theo build)
+const searchFn  = typeof zingRaw?.search === "function" ? zingRaw.search : null;
+const getSongFn = (["getSong","getStreaming","getSongStreaming"]
+  .map(k => typeof zingRaw?.[k] === "function" ? zingRaw[k] : null)
+  .find(Boolean));
+
+if (!searchFn || !getSongFn) {
+  console.error("❌ Không tìm thấy hàm search/getSong trong zingmp3-api-next@1.0.4");
+  process.exit(1);
 }
-
-// Thử nạp các thư viện community khác nhau
-const libNext  = safeRequire("zingmp3-api-next");  // thường: { zing: {...} } hoặc object khác
-const libFull  = safeRequire("zingmp3-api-full");  // thường: ZingMp3.xxx
-const libPlain = safeRequire("zingmp3-api");       // thường: zingmp3.xxx
-
-// Chuẩn hoá API: trả về 2 hàm async: search(q) & getSong(id)
-function makeZingAPI() {
-  // Các candidate hàm từ từng lib (tên có thể khác nhau theo repo)
-  const cand = [];
-
-  // --- zingmp3-api-next ---
-  if (libNext) {
-    const z = libNext.zing || libNext.default || libNext;
-    cand.push({
-      src: "zingmp3-api-next",
-      search: z?.search,
-      getSong: z?.getSong || z?.getStreaming || z?.getSongStreaming
-    });
-  }
-
-  // --- zingmp3-api-full ---
-  if (libFull) {
-    const Z = libFull.ZingMp3 || libFull.default || libFull;
-    cand.push({
-      src: "zingmp3-api-full",
-      search: Z?.search,
-      getSong: Z?.getStreaming || Z?.getSongStreaming || Z?.getSong
-    });
-  }
-
-  // --- zingmp3-api (whoant) ---
-  if (libPlain) {
-    const zp = libPlain.zingmp3 || libPlain.default || libPlain;
-    cand.push({
-      src: "zingmp3-api",
-      search: zp?.search,
-      getSong: zp?.getSong || zp?.getStreaming || zp?.getSongStreaming
-    });
-  }
-
-  // Chọn candidate đầu tiên có đủ 2 hàm
-  const picked = cand.find(c => typeof c.search === "function" && typeof c.getSong === "function");
-  if (!picked) throw new Error("No usable Zing API lib found");
-
-  // Bao bọc kết quả về chung 1 dạng
-  async function search(q) {
-    const raw = await picked.search(q);
-    // Chuẩn hoá lấy bài đầu trong data.songs
-    const songs = raw?.data?.songs || raw?.songs || raw?.data || [];
-    const first = Array.isArray(songs) ? songs[0] : songs?.songs?.[0];
-    return { lib: picked.src, raw, first };
-  }
-
-  async function getSong(encodeId) {
-    const raw = await picked.getSong(encodeId);
-    // Các lib có thể trả: {data:{'128':url,'320':url}} hoặc {data:{streaming:{'128':url}}}
-    const data = raw?.data || {};
-    const url128 = data["128"] || data?.streaming?.["128"];
-    const url320 = data["320"] || data?.streaming?.["320"];
-    return { lib: picked.src, raw, url128, url320 };
-  }
-
-  return { search, getSong, src: picked.src };
-}
-
-const zing = makeZingAPI();
 
 const app = express();
 app.use(cors());
 
-// Debug: xem lib nào đang dùng & hàm nào có sẵn
-app.get("/debug/libs", (req, res) => {
-  res.json({
-    using: zing.src,
-    have: {
-      next: !!libNext,
-      full: !!libFull,
-      plain: !!libPlain
-    }
-  });
-});
-
-// /api/zing?song=...&artist=...&quality=128|320
+// GET /api/zing?song=&artist=&quality=128|320
 app.get("/api/zing", async (req, res) => {
   try {
     const song = (req.query.song || "").toString().trim();
@@ -99,27 +30,33 @@ app.get("/api/zing", async (req, res) => {
 
     const q = artist ? `${song} ${artist}` : song;
 
-    const { first } = await zing.search(q);
+    // 1) tìm bài
+    const s = await searchFn(q);
+    const first = s?.data?.songs?.[0];
     if (!first?.encodeId) return res.status(404).json({ error: "not_found" });
 
-    const { url128, url320 } = await zing.getSong(first.encodeId);
-    const pick = quality === "320" ? (url320 || url128) : (url128 || url320);
+    // 2) lấy link phát
+    const st = await getSongFn(first.encodeId);
+    const u128 = st?.data?.["128"] || st?.data?.streaming?.["128"];
+    const u320 = st?.data?.["320"] || st?.data?.streaming?.["320"];
+    const pick = (quality === "320" ? (u320 || u128) : (u128 || u320));
     if (!pick) return res.status(502).json({ error: "no_stream" });
 
-    // ESP32 đang ghép base_url + audio_url → trả đường dẫn tương đối /p?u=...
+    // Trả schema mà ESP32 đang parse: audio_url là đường dẫn tương đối /p?u=...
     return res.json({
       artist: first.artistsNames || artist,
       title: first.title || song,
       audio_url: "/p?u=" + encodeURIComponent(pick),
       lyric_url: "",
-      quality: pick === url320 ? "320" : "128"
+      quality: pick === u320 ? "320" : "128"
     });
   } catch (e) {
-    res.status(500).json({ error: e.message || "server_error" });
+    res.status(500).json({ error: e?.message || "server_error" });
   }
 });
 
-// Proxy stream /p?u=<remote_mp3_url>
+// Proxy stream: /p?u=<remote_mp3_url>
+// Node 22 có global fetch → dùng trực tiếp
 app.get("/p", async (req, res) => {
   try {
     const u = req.query.u;
@@ -137,11 +74,21 @@ app.get("/p", async (req, res) => {
     if (r.headers.get("accept-ranges")) res.set("Accept-Ranges", r.headers.get("accept-ranges"));
     if (r.headers.get("content-range")) res.set("Content-Range", r.headers.get("content-range"));
     if (r.headers.get("content-length")) res.set("Content-Length", r.headers.get("content-length"));
-
     r.body.pipe(res);
   } catch (e) {
     res.status(500).send("proxy_error");
   }
+});
+
+// Debug xem hàm đã bắt được chưa
+app.get("/debug/libs", (req, res) => {
+  res.json({
+    lib: "zingmp3-api-next@1.0.4",
+    has: {
+      search: !!searchFn,
+      getSong: !!getSongFn
+    }
+  });
 });
 
 app.get("/", (_, res) => res.send("OK"));
