@@ -8,6 +8,8 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "zingmp3-api-next": "1.0.4"
+    "zingmp3-api": "^1.2.2",
+    "zingmp3-api-next": "1.0.4",
+    "zingmp3-api-full": "^3.0.0"
   }
 }
